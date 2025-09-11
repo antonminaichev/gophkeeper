@@ -1,0 +1,233 @@
+package handlers
+
+// Vault gRPC service: CRUD for user items.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	pb "github.com/antonminaichev/gophkeeper/api/proto"
+	gauth "github.com/antonminaichev/gophkeeper/internal/auth"
+	"github.com/antonminaichev/gophkeeper/internal/server/storage"
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+)
+
+type VaultServer struct {
+	pb.UnimplementedVaultServiceServer
+	items storage.ItemsRepository
+}
+
+func NewVaultServer(items storage.ItemsRepository) *VaultServer {
+	return &VaultServer{items: items}
+}
+
+// CreateItem creates a new item owned by the authenticated user.
+func (s *VaultServer) CreateItem(ctx context.Context, r *pb.CreateItemRequest) (*pb.ItemID, error) {
+	owner, err := userIDFromCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Zero value means "unspecified" for enum.
+	if r.GetType() == pb.ItemType(0) {
+		return nil, status.Error(codes.InvalidArgument, "item type is required")
+	}
+	metaJSON, err := metaToJSON(r.GetMeta())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid meta")
+	}
+	var alias *string
+	if a := strings.TrimSpace(r.GetAlias()); a != "" {
+		alias = &a
+	}
+
+	id, _, err := s.items.Create(ctx, owner, int16(r.GetType()), r.GetPayload(), metaJSON, alias)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "cannot create item")
+	}
+	return &pb.ItemID{Id: id.String()}, nil
+}
+
+// GetItemByRef fetches an item by UUID / human id / alias.
+func (s *VaultServer) GetItemByRef(ctx context.Context, ref *pb.ItemRef) (*pb.Item, error) {
+	owner, err := userIDFromCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var it *storage.Item
+	switch x := ref.GetRef().(type) {
+	case *pb.ItemRef_Id:
+		idStr := strings.TrimSpace(x.Id)
+		itemID, parseErr := uuid.Parse(idStr)
+		if parseErr != nil {
+			return nil, status.Error(codes.InvalidArgument, "bad id")
+		}
+		it, err = s.items.Get(ctx, owner, itemID)
+	case *pb.ItemRef_HumanId:
+		it, err = s.items.GetByHuman(ctx, owner, x.HumanId)
+	case *pb.ItemRef_Alias:
+		a := strings.TrimSpace(x.Alias)
+		if a == "" {
+			return nil, status.Error(codes.InvalidArgument, "empty alias")
+		}
+		it, err = s.items.GetByAlias(ctx, owner, a)
+	default:
+		return nil, status.Error(codes.InvalidArgument, "empty ref")
+	}
+	if err != nil {
+		return nil, status.Error(codes.NotFound, "item not found")
+	}
+	return toPB(it), nil
+}
+
+// ListItems returns a short list of the user's items.
+func (s *VaultServer) ListItems(ctx context.Context, r *pb.ListRequest) (*pb.ListResponse, error) {
+	owner, err := userIDFromCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	limit := r.GetLimit()
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	items, err := s.items.List(ctx, owner, limit)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "cannot list items")
+	}
+	out := make([]*pb.Item, 0, len(items))
+	for i := range items {
+		out = append(out, toPB(&items[i]))
+	}
+	return &pb.ListResponse{Items: out}, nil
+}
+
+// UpdateItem applies optimistic update by version.
+func (s *VaultServer) UpdateItem(ctx context.Context, r *pb.UpdateItemRequest) (*pb.Item, error) {
+	owner, err := userIDFromCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, err := uuid.Parse(strings.TrimSpace(r.GetId()))
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "bad id")
+	}
+	if r.GetExpectedVersion() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "expected_version is required")
+	}
+
+	metaJSON, err := metaToJSON(r.GetMeta())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid meta")
+	}
+
+	it, err := s.items.Update(ctx, owner, id, r.GetPayload(), metaJSON, r.GetExpectedVersion())
+	if err != nil {
+		return nil, mapUpdateErr(err)
+	}
+	return toPB(it), nil
+}
+
+// DeleteItem marks an item as deleted.
+func (s *VaultServer) DeleteItem(ctx context.Context, r *pb.ItemID) (*emptypb.Empty, error) {
+	owner, err := userIDFromCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, err := uuid.Parse(strings.TrimSpace(r.GetId()))
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "bad id")
+	}
+	if err := s.items.Delete(ctx, owner, id); err != nil {
+		return nil, status.Error(codes.Internal, "cannot delete item")
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// userIDFromCtx extracts and validates owner id from context.
+func userIDFromCtx(ctx context.Context) (uuid.UUID, error) {
+	uid, ok := gauth.UserIDFrom(ctx)
+	if !ok || strings.TrimSpace(uid) == "" {
+		return uuid.Nil, status.Error(codes.Unauthenticated, "missing user")
+	}
+	id, err := uuid.Parse(uid)
+	if err != nil {
+		return uuid.Nil, status.Error(codes.Unauthenticated, "bad user id")
+	}
+	return id, nil
+}
+
+// toPB converts storage.Item to protobuf.
+func toPB(it *storage.Item) *pb.Item {
+	var alias string
+	if it.Alias != nil {
+		alias = *it.Alias
+	}
+	return &pb.Item{
+		Id:            it.ID.String(),
+		HumanId:       *it.HumanID,
+		Alias:         alias,
+		Type:          pb.ItemType(it.Type),
+		Payload:       it.Payload,
+		Meta:          mapToMeta(it.MetaJSON),
+		Version:       it.Version,
+		UpdatedAtUnix: it.UpdatedAt.Unix(),
+		Deleted:       it.DeletedAt != nil,
+	}
+}
+
+// mapToMeta decodes JSON {"k":"v",...} into protobuf entries.
+func mapToMeta(b []byte) []*pb.ItemMetaEntry {
+	if len(b) == 0 {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil
+	}
+	out := make([]*pb.ItemMetaEntry, 0, len(m))
+	for k, v := range m {
+		out = append(out, &pb.ItemMetaEntry{Key: k, Value: v})
+	}
+	return out
+}
+
+// metaToJSON encodes protobuf entries into a compact JSON map.
+func metaToJSON(entries []*pb.ItemMetaEntry) ([]byte, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	m := make(map[string]string, len(entries))
+	for _, e := range entries {
+		k := strings.TrimSpace(e.GetKey())
+		if k == "" {
+			continue
+		}
+		m[k] = e.GetValue()
+	}
+	if len(m) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(m)
+}
+
+// mapUpdateErr converts repository update errors to gRPC codes.
+func mapUpdateErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return status.Error(codes.Canceled, "request cancelled")
+	}
+	// Optimistic lock / version mismatch — use Aborted to hint client to retry.
+	l := strings.ToLower(err.Error())
+	if strings.Contains(l, "version") || strings.Contains(l, "conflict") {
+		return status.Error(codes.Aborted, "version conflict")
+	}
+	return status.Error(codes.Internal, "cannot update item")
+}

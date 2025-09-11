@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package gk.api;
+option go_package = "github.com/antonminaichev/gophkeeper/api/proto;proto";
+
+import "google/protobuf/empty.proto";
+
+enum ItemType {
+  LOGIN  = 0;
+  TEXT   = 1;
+  BINARY = 2;
+  CARD   = 3;
+}
+
+message ItemMetaEntry {
+  string key = 1;
+  string value = 2;
+}
+
+// Полная модель элемента (сервер -> клиент)
+message Item {
+  string id = 1;                    // внутренний UUID
+  ItemType type = 2;
+  bytes payload = 3;                // (MVP) сырой контент; далее будет шифротекст
+  repeated ItemMetaEntry meta = 4;  // произвольная мета (нечувствит.)
+  int64 version = 5;
+  int64 updated_at_unix = 6;
+  bool deleted = 7;
+  int64 human_id = 8;               // короткий ID владельца (1,2,3…)
+  string alias = 9;                 // @github и т.п. (опционально)
+}
+
+message ItemID { string id = 1; }   // выбор по UUID (для совместимости)
+
+// Универсальный селектор элемента (любой из трёх ключей)
+message ItemRef {
+  oneof ref {
+    string id = 1;       // UUID
+    int64 human_id = 2;  // 1,2,3...
+    string alias = 3;    // "@github" (без @ передавать тоже ок)
+  }
+}
+
+// Создание элемента
+message CreateItemRequest {
+  ItemType type = 1;
+  bytes payload = 2;
+  repeated ItemMetaEntry meta = 3;
+  string alias = 4;       // опционально задать сразу
+}
+
+// Обновление элемента по UUID (для простоты MVP)
+message UpdateItemRequest {
+  string id = 1;                     // UUID
+  bytes payload = 2;                 // если пусто — оставить прежний
+  repeated ItemMetaEntry meta = 3;   // если пусто — оставить прежний
+  int64 expected_version = 4;        // для защиты от гонок (опционально)
+}
+
+// Листинг
+message ListRequest {
+  int32 limit = 1;                   // 1..500 (дефолт 100)
+  string cursor = 2;                 // резерв под постраничку
+}
+message ListResponse {
+  repeated Item items = 1;           // на листинге payload может быть пуст
+  string next_cursor = 2;
+}
+
+service VaultService {
+  // CRUD
+  rpc CreateItem      (CreateItemRequest)  returns (ItemID);
+  rpc GetItem         (ItemID)             returns (Item);                  // по UUID (совм.)
+  rpc GetItemByRef    (ItemRef)            returns (Item);                  // по любому ключу
+  rpc ListItems       (ListRequest)        returns (ListResponse);
+  rpc UpdateItem      (UpdateItemRequest)  returns (Item);
+  rpc DeleteItem      (ItemID)             returns (google.protobuf.Empty); // по UUID
+  rpc DeleteItemByRef (ItemRef)            returns (google.protobuf.Empty); // по любому ключу
+}
