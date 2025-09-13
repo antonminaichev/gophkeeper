@@ -1,9 +1,12 @@
-// GophKeeper CLI — client for auth and vault operations.
 package main
+
+// GophKeeper CLI — small interactive client for auth and vault operations.
 
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"os"
@@ -15,24 +18,30 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
-// Vars for -ldflags for build.
+// Set via -ldflags at build time.
 var (
 	version = "dev"
 	commit  = "none"
 	date    = "unknown"
 )
 
-// Global flags (bound in init()).
+// Global flags.
 var (
 	serverAddr  string
-	accessToken string
+	accessToken string // optional: overrides session if provided
+
+	// TLS flags
+	tlsEnable             bool
+	tlsCAPath             string
+	tlsServerName         string
+	tlsInsecureSkipVerify bool
 )
 
-// Timeout const
 const rpcTimeout = 10 * time.Second
 
 func main() {
@@ -48,41 +57,27 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	// Global flags
+	// Connection & auth flags
 	rootCmd.PersistentFlags().StringVar(&serverAddr, "server", "localhost:8090", "gRPC server address")
-	rootCmd.PersistentFlags().StringVar(&accessToken, "token", os.Getenv("GK_ACCESS_TOKEN"), "Access JWT (optional for auth endpoints)")
+	rootCmd.PersistentFlags().StringVar(&accessToken, "token", os.Getenv("GK_ACCESS_TOKEN"), "Access JWT (optional, overrides saved session)")
 
-	// First level commands
+	// TLS flags
+	rootCmd.PersistentFlags().BoolVar(&tlsEnable, "tls", false, "Use TLS for gRPC transport")
+	rootCmd.PersistentFlags().StringVar(&tlsCAPath, "tls-ca", "", "Path to custom CA bundle (PEM)")
+	rootCmd.PersistentFlags().StringVar(&tlsServerName, "tls-server-name", "", "Override TLS server name (SNI/verify)")
+	rootCmd.PersistentFlags().BoolVar(&tlsInsecureSkipVerify, "tls-insecure-skip-verify", false, "Skip certificate verification (NOT recommended)")
+
+	// Commands
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(registerCmd)
 	rootCmd.AddCommand(loginCmd)
+	rootCmd.AddCommand(logoutCmd)
 
-	// Items commands
 	itemCmd.AddCommand(itemAddTextCmd)
 	itemCmd.AddCommand(itemListCmd)
 	itemCmd.AddCommand(itemGetCmd)
 	rootCmd.AddCommand(itemCmd)
 }
-
-// gRPC CLI
-
-func dialVaultClient(ctx context.Context) (pb.VaultServiceClient, *grpc.ClientConn, error) {
-	conn, err := grpc.DialContext(ctx, serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, err
-	}
-	return pb.NewVaultServiceClient(conn), conn, nil
-}
-
-func dialAuthClient(ctx context.Context) (pb.AuthServiceClient, *grpc.ClientConn, error) {
-	conn, err := grpc.DialContext(ctx, serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, err
-	}
-	return pb.NewAuthServiceClient(conn), conn, nil
-}
-
-// Version command
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
@@ -91,8 +86,6 @@ var versionCmd = &cobra.Command{
 		fmt.Printf("gk %s (commit %s, built %s)\n", version, commit, date)
 	},
 }
-
-// register/login commands
 
 var registerCmd = &cobra.Command{
 	Use:   "register",
@@ -142,7 +135,7 @@ var registerCmd = &cobra.Command{
 
 var loginCmd = &cobra.Command{
 	Use:   "login",
-	Short: "Login (interactive)",
+	Short: "Login (interactive) and save session",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		email, err := readLine("Email: ")
 		if err != nil {
@@ -175,14 +168,25 @@ var loginCmd = &cobra.Command{
 			return err
 		}
 
-		// For now we just print tokens. Later this could be stored in a keyring.
-		fmt.Println("ACCESS :", resp.AccessToken)
-		fmt.Println("REFRESH:", resp.RefreshToken)
+		if err := SaveLoginTokens(resp.AccessToken, resp.RefreshToken); err != nil {
+			return fmt.Errorf("save session: %w", err)
+		}
+		fmt.Println("Logged in. Session saved.")
 		return nil
 	},
 }
 
-// items command
+var logoutCmd = &cobra.Command{
+	Use:   "logout",
+	Short: "Clear saved session",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := ClearSession(); err != nil {
+			return err
+		}
+		fmt.Println("Session cleared.")
+		return nil
+	},
+}
 
 var itemCmd = &cobra.Command{
 	Use:   "item",
@@ -193,10 +197,6 @@ var itemAddTextCmd = &cobra.Command{
 	Use:   "add text",
 	Short: "Add TEXT item (interactive)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := requireAuth(); err != nil {
-			return err
-		}
-
 		title, err := readLine("Title (meta.title): ")
 		if err != nil {
 			return err
@@ -208,8 +208,13 @@ var itemAddTextCmd = &cobra.Command{
 		alias, _ := readLine("Alias (optional, like @github): ")
 		alias = strings.TrimSpace(strings.TrimPrefix(alias, "@"))
 
-		ctx, cancel := context.WithTimeout(withAuth(context.Background()), rpcTimeout)
+		baseCtx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
+		ctx, _, err := attachAuth(baseCtx)
+		if err != nil {
+			return err
+		}
+
 		c, conn, err := dialVaultClient(ctx)
 		if err != nil {
 			return err
@@ -235,12 +240,13 @@ var itemListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List items (meta only)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := requireAuth(); err != nil {
+		baseCtx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		ctx, _, err := attachAuth(baseCtx)
+		if err != nil {
 			return err
 		}
 
-		ctx, cancel := context.WithTimeout(withAuth(context.Background()), rpcTimeout)
-		defer cancel()
 		c, conn, err := dialVaultClient(ctx)
 		if err != nil {
 			return err
@@ -256,7 +262,6 @@ var itemListCmd = &cobra.Command{
 			return nil
 		}
 
-		// Header
 		fmt.Printf("%-22s  %-6s  %-4s  %s\n", "ID", "TYPE", "VER", "TITLE")
 		fmt.Printf("%-22s  %-6s  %-4s  %s\n",
 			strings.Repeat("-", 22),
@@ -268,7 +273,6 @@ var itemListCmd = &cobra.Command{
 		for _, it := range resp.Items {
 			title := metaTitle(it.Meta)
 			tag := humanTag(it)
-
 			fmt.Printf("%-22s  %-6s  %-4s  %s\n",
 				tag,
 				it.Type.String(),
@@ -285,10 +289,6 @@ var itemGetCmd = &cobra.Command{
 	Short: "Get full item by UUID, human id (#) or alias",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := requireAuth(); err != nil {
-			return err
-		}
-
 		selector := strings.TrimSpace(args[0])
 		req := &pb.ItemRef{}
 
@@ -298,7 +298,6 @@ var itemGetCmd = &cobra.Command{
 		case strings.HasPrefix(selector, "@"):
 			req.Ref = &pb.ItemRef_Alias{Alias: strings.TrimPrefix(selector, "@")}
 		default:
-			// try numeric human_id
 			if n, err := strconv.ParseInt(selector, 10, 64); err == nil && n > 0 {
 				req.Ref = &pb.ItemRef_HumanId{HumanId: n}
 			} else {
@@ -306,8 +305,13 @@ var itemGetCmd = &cobra.Command{
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(withAuth(context.Background()), rpcTimeout)
+		baseCtx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 		defer cancel()
+		ctx, _, err := attachAuth(baseCtx)
+		if err != nil {
+			return err
+		}
+
 		c, conn, err := dialVaultClient(ctx)
 		if err != nil {
 			return err
@@ -328,7 +332,6 @@ var itemGetCmd = &cobra.Command{
 		}
 		fmt.Println("Type    :", it.Type.String())
 		fmt.Println("Version :", it.Version)
-
 		if t := metaTitle(it.Meta); t != "" {
 			fmt.Println("Title   :", t)
 		}
@@ -340,20 +343,7 @@ var itemGetCmd = &cobra.Command{
 	},
 }
 
-// Tag for searching
-func humanTag(it *pb.Item) string {
-	var parts []string
-	if it.HumanId > 0 {
-		parts = append(parts, fmt.Sprintf("#%d", it.HumanId))
-	}
-	if it.Alias != "" {
-		parts = append(parts, "(@"+it.Alias+")")
-	}
-	if len(parts) == 0 {
-		return it.Id
-	}
-	return strings.Join(parts, " ")
-}
+// Helpers: IO, validation, auth attachment, dialing.
 
 func readLine(prompt string) (string, error) {
 	fmt.Print(prompt)
@@ -363,15 +353,6 @@ func readLine(prompt string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(s), nil
-}
-
-func metaTitle(meta []*pb.ItemMetaEntry) string {
-	for _, kv := range meta {
-		if kv.Key == "title" {
-			return kv.Value
-		}
-	}
-	return ""
 }
 
 func readPassword(prompt string) (string, error) {
@@ -397,16 +378,88 @@ func looksLikeUUID(s string) bool {
 	return len(s) == 36 && strings.Count(s, "-") == 4
 }
 
-func withAuth(ctx context.Context) context.Context {
+// attachAuth chooses the best available auth method.
+// Priority: --token/env > saved session (with auto-refresh).
+func attachAuth(ctx context.Context) (context.Context, *Session, error) {
 	if t := strings.TrimSpace(accessToken); t != "" {
-		return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+t)
+		return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+t), nil, nil
 	}
-	return ctx
+	// NOTE: refresh in session.go пока использует свои настройки. Позже можно
+	// прокинуть TLS-параметры и туда, чтобы refresh тоже ходил по TLS.
+	return EnsureAuth(ctx, serverAddr)
 }
 
-func requireAuth() error {
-	if strings.TrimSpace(accessToken) == "" {
-		return fmt.Errorf("authorization required: pass --token or set GK_ACCESS_TOKEN")
+func dialVaultClient(ctx context.Context) (pb.VaultServiceClient, *grpc.ClientConn, error) {
+	conn, err := clientDial(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
-	return nil
+	return pb.NewVaultServiceClient(conn), conn, nil
+}
+
+func dialAuthClient(ctx context.Context) (pb.AuthServiceClient, *grpc.ClientConn, error) {
+	conn, err := clientDial(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pb.NewAuthServiceClient(conn), conn, nil
+}
+
+// clientDial builds a client connection honoring TLS flags.
+func clientDial(ctx context.Context) (*grpc.ClientConn, error) {
+	if !tlsEnable {
+		return grpc.DialContext(ctx, serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	tcfg, err := makeClientTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+	return grpc.DialContext(ctx, serverAddr, grpc.WithTransportCredentials(credentials.NewTLS(tcfg)))
+}
+
+// makeClientTLSConfig assembles tls.Config from CLI flags.
+func makeClientTLSConfig() (*tls.Config, error) {
+	cfg := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: tlsInsecureSkipVerify, // NOT recommended; for quick local tests only
+	}
+	if tlsServerName != "" {
+		cfg.ServerName = tlsServerName
+	}
+	if strings.TrimSpace(tlsCAPath) != "" {
+		data, err := os.ReadFile(tlsCAPath)
+		if err != nil {
+			return nil, fmt.Errorf("read CA file: %w", err)
+		}
+		cp := x509.NewCertPool()
+		if !cp.AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("parse CA file: no certs found")
+		}
+		cfg.RootCAs = cp
+	}
+	return cfg, nil
+}
+
+func metaTitle(meta []*pb.ItemMetaEntry) string {
+	for _, kv := range meta {
+		if kv.Key == "title" {
+			return kv.Value
+		}
+	}
+	return ""
+}
+
+// Builds printable tag: prefer "#<human_id>" and "(@alias)"; fallback to UUID.
+func humanTag(it *pb.Item) string {
+	var parts []string
+	if it.HumanId > 0 {
+		parts = append(parts, fmt.Sprintf("#%d", it.HumanId))
+	}
+	if it.Alias != "" {
+		parts = append(parts, "(@"+it.Alias+")")
+	}
+	if len(parts) == 0 {
+		return it.Id
+	}
+	return strings.Join(parts, " ")
 }
