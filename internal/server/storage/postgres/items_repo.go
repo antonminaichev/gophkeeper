@@ -123,6 +123,39 @@ func (r *ItemsRepo) List(ctx context.Context, owner uuid.UUID, limit int32) ([]s
 	return items, rows.Err()
 }
 
+// ListChanges provides a stable, forward-only change feed since (after, afterID).
+func (r *ItemsRepo) ListChanges(ctx context.Context, owner uuid.UUID, after time.Time, afterID uuid.UUID, limit int32) ([]storage.Item, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, owner_id, human_id, alias, type, payload, meta, version,
+		       deleted_at, updated_at, created_at
+		FROM items
+		WHERE owner_id = $1
+		  AND (
+		       updated_at > $2
+		       OR (updated_at = $2 AND id > $3)
+		  )
+		ORDER BY updated_at ASC, id ASC
+		LIMIT $4
+	`, owner, after, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]storage.Item, 0, limit)
+	for rows.Next() {
+		it, err := scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *it)
+	}
+	return out, rows.Err()
+}
+
 // Update applies concurrency by version and returns the new row.
 func (r *ItemsRepo) Update(
 	ctx context.Context,
@@ -156,7 +189,7 @@ func (r *ItemsRepo) Update(
 	return it, nil
 }
 
-// Delete marks the item as deleted.
+// Delete marks the item as deleted and bumps updated_at (tombstone entry).
 func (r *ItemsRepo) Delete(ctx context.Context, owner uuid.UUID, id uuid.UUID) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE items

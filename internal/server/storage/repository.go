@@ -39,6 +39,7 @@ type ItemsRepository interface {
 	GetByHuman(ctx context.Context, owner uuid.UUID, hid int64) (*Item, error)
 	GetByAlias(ctx context.Context, owner uuid.UUID, alias string) (*Item, error)
 	List(ctx context.Context, owner uuid.UUID, limit int32) ([]Item, error)
+	ListChanges(ctx context.Context, owner uuid.UUID, after time.Time, afterID uuid.UUID, limit int32) ([]Item, error)
 	Update(ctx context.Context, owner uuid.UUID, id uuid.UUID, payload, metaJSON []byte, expectedVersion int64) (*Item, error)
 	Delete(ctx context.Context, owner uuid.UUID, id uuid.UUID) error
 }

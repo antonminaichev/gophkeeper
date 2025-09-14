@@ -1,12 +1,14 @@
 package handlers
 
-// Vault gRPC service: CRUD for user items.
+// Vault gRPC service: CRUD for user items, with sync cursor support.
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	pb "github.com/antonminaichev/gophkeeper/api/proto"
 	gauth "github.com/antonminaichev/gophkeeper/internal/auth"
@@ -32,10 +34,17 @@ func (s *VaultServer) CreateItem(ctx context.Context, r *pb.CreateItemRequest) (
 	if err != nil {
 		return nil, err
 	}
-	// Zero value means "unspecified" for enum.
-	if r.GetType() == pb.ItemType(0) {
-		return nil, status.Error(codes.InvalidArgument, "item type is required")
+
+	t := r.GetType()
+	if t == 0 {
+		t = pb.ItemType_LOGIN
 	}
+	switch t {
+	case pb.ItemType_LOGIN, pb.ItemType_TEXT, pb.ItemType_BINARY, pb.ItemType_CARD:
+	default:
+		return nil, status.Error(codes.InvalidArgument, "unknown item type")
+	}
+
 	metaJSON, err := metaToJSON(r.GetMeta())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid meta")
@@ -45,7 +54,7 @@ func (s *VaultServer) CreateItem(ctx context.Context, r *pb.CreateItemRequest) (
 		alias = &a
 	}
 
-	id, _, err := s.items.Create(ctx, owner, int16(r.GetType()), r.GetPayload(), metaJSON, alias)
+	id, _, err := s.items.Create(ctx, owner, int16(t), r.GetPayload(), metaJSON, alias)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "cannot create item")
 	}
@@ -85,7 +94,6 @@ func (s *VaultServer) GetItemByRef(ctx context.Context, ref *pb.ItemRef) (*pb.It
 	return toPB(it), nil
 }
 
-// ListItems returns a short list of the user's items.
 func (s *VaultServer) ListItems(ctx context.Context, r *pb.ListRequest) (*pb.ListResponse, error) {
 	owner, err := userIDFromCtx(ctx)
 	if err != nil {
@@ -96,15 +104,48 @@ func (s *VaultServer) ListItems(ctx context.Context, r *pb.ListRequest) (*pb.Lis
 		limit = 100
 	}
 
-	items, err := s.items.List(ctx, owner, limit)
+	cursorStr := strings.TrimSpace(r.GetCursor())
+	// Regular list (no sync cursor): show live, non-deleted items.
+	if cursorStr == "" {
+		items, err := s.items.List(ctx, owner, limit)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "cannot list items")
+		}
+		out := make([]*pb.Item, 0, len(items))
+		for i := range items {
+			p := toPB(&items[i])
+			// Keep list responses light: payload isn't needed here.
+			p.Payload = nil
+			out = append(out, p)
+		}
+		return &pb.ListResponse{Items: out}, nil
+	}
+
+	// Change feed mode: decode cursor and return changes after it.
+	afterT, afterID, err := decodeCursor(cursorStr)
 	if err != nil {
-		return nil, status.Error(codes.Internal, "cannot list items")
+		return nil, status.Error(codes.InvalidArgument, "bad cursor")
 	}
-	out := make([]*pb.Item, 0, len(items))
-	for i := range items {
-		out = append(out, toPB(&items[i]))
+
+	changes, err := s.items.ListChanges(ctx, owner, afterT, afterID, limit)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "cannot list changes")
 	}
-	return &pb.ListResponse{Items: out}, nil
+
+	resp := &pb.ListResponse{Items: make([]*pb.Item, 0, len(changes))}
+	for i := range changes {
+		p := toPB(&changes[i])
+		// For sync we usually don't need payload; clients fetch by id when needed.
+		p.Payload = nil
+		resp.Items = append(resp.Items, p)
+	}
+
+	// Compute next cursor from the last row (if any).
+	if n := len(changes); n > 0 {
+		last := changes[n-1]
+		resp.NextCursor = encodeCursor(last.UpdatedAt, last.ID)
+	}
+	return resp, nil
 }
 
 // UpdateItem applies optimistic update by version.
@@ -128,12 +169,12 @@ func (s *VaultServer) UpdateItem(ctx context.Context, r *pb.UpdateItemRequest) (
 
 	it, err := s.items.Update(ctx, owner, id, r.GetPayload(), metaJSON, r.GetExpectedVersion())
 	if err != nil {
-		return nil, mapUpdateErr(err)
+		return nil, err
 	}
 	return toPB(it), nil
 }
 
-// DeleteItem marks an item as deleted.
+// DeleteItem marks the item as deleted and bumps updated_at (tombstone entry).
 func (s *VaultServer) DeleteItem(ctx context.Context, r *pb.ItemID) (*emptypb.Empty, error) {
 	owner, err := userIDFromCtx(ctx)
 	if err != nil {
@@ -168,9 +209,13 @@ func toPB(it *storage.Item) *pb.Item {
 	if it.Alias != nil {
 		alias = *it.Alias
 	}
+	hid := int64(0)
+	if it.HumanID != nil {
+		hid = *it.HumanID
+	}
 	return &pb.Item{
 		Id:            it.ID.String(),
-		HumanId:       *it.HumanID,
+		HumanId:       hid,
 		Alias:         alias,
 		Type:          pb.ItemType(it.Type),
 		Payload:       it.Payload,
@@ -203,31 +248,40 @@ func metaToJSON(entries []*pb.ItemMetaEntry) ([]byte, error) {
 		return nil, nil
 	}
 	m := make(map[string]string, len(entries))
-	for _, e := range entries {
-		k := strings.TrimSpace(e.GetKey())
+	for _, kv := range entries {
+		k := strings.TrimSpace(kv.GetKey())
 		if k == "" {
-			continue
+			return nil, errors.New("empty meta key")
 		}
-		m[k] = e.GetValue()
-	}
-	if len(m) == 0 {
-		return nil, nil
+		m[k] = kv.GetValue()
 	}
 	return json.Marshal(m)
 }
 
-// mapUpdateErr converts repository update errors to gRPC codes.
-func mapUpdateErr(err error) error {
-	if err == nil {
-		return nil
+// Cursor helpers: stable, opaque base64(JSON{u,id}).
+type listCursor struct {
+	U int64  `json:"u"` // updated_at as unix seconds
+	I string `json:"i"` // uuid string
+}
+
+func encodeCursor(t time.Time, id uuid.UUID) string {
+	raw, _ := json.Marshal(listCursor{U: t.Unix(), I: id.String()})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeCursor(s string) (time.Time, uuid.UUID, error) {
+	data, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return time.Time{}, uuid.Nil, err
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return status.Error(codes.Canceled, "request cancelled")
+	var c listCursor
+	if err := json.Unmarshal(data, &c); err != nil {
+		return time.Time{}, uuid.Nil, err
 	}
-	// Optimistic lock / version mismatch — use Aborted to hint client to retry.
-	l := strings.ToLower(err.Error())
-	if strings.Contains(l, "version") || strings.Contains(l, "conflict") {
-		return status.Error(codes.Aborted, "version conflict")
+	t := time.Unix(c.U, 0)
+	uid, err := uuid.Parse(c.I)
+	if err != nil {
+		return time.Time{}, uuid.Nil, err
 	}
-	return status.Error(codes.Internal, "cannot update item")
+	return t, uid, nil
 }

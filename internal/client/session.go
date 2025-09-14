@@ -1,4 +1,4 @@
-package main
+package client
 
 // Session management for GophKeeper CLI.
 
@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	pb "github.com/antonminaichev/gophkeeper/api/proto"
-	"github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -29,12 +27,13 @@ func sessionFile() (string, error) {
 	return path, nil
 }
 
-// Session represents persisted auth state.
+// Session represents persisted auth state (+ sync cursor).
 type Session struct {
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
 	AccessExp    time.Time `json:"access_exp"` // parsed from JWT "exp"
 	SavedAt      time.Time `json:"saved_at"`
+	SyncCursor   string    `json:"sync_cursor,omitempty"`
 }
 
 // LoadSession reads session from disk.
@@ -117,70 +116,4 @@ func SaveLoginTokens(access, refresh string) error {
 		RefreshToken: refresh,
 		AccessExp:    exp,
 	})
-}
-
-// EnsureAuth loads session, refreshes if needed, and returns ctx with header.
-func EnsureAuth(ctx context.Context, serverAddr string) (context.Context, *Session, error) {
-	s, err := LoadSession()
-	if err != nil {
-		return ctx, nil, fmt.Errorf("not logged in: %w", err)
-	}
-	if s.AccessValid() {
-		return s.WithAuth(ctx), s, nil
-	}
-	if s.RefreshToken == "" {
-		return ctx, nil, errors.New("no refresh token; please login")
-	}
-	newS, err := refreshSession(ctx, serverAddr, s.RefreshToken)
-	if err != nil {
-		return ctx, nil, fmt.Errorf("refresh failed: %w", err)
-	}
-	if err := SaveSession(newS); err != nil {
-		return ctx, nil, fmt.Errorf("save session: %w", err)
-	}
-	return newS.WithAuth(ctx), newS, nil
-}
-
-// refreshSession calls AuthService.Refresh and builds a new Session.
-func refreshSession(ctx context.Context, _ string, refresh string) (*Session, error) {
-	// Use a short-lived connection with the same TLS/transport settings.
-	conn, err := clientDial(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	c := pb.NewAuthServiceClient(conn)
-	resp, err := c.Refresh(ctx, &pb.RefreshRequest{RefreshToken: refresh})
-	if err != nil {
-		return nil, err
-	}
-	exp, err := parseExp(resp.GetAccessToken())
-	if err != nil {
-		return nil, err
-	}
-	return &Session{
-		AccessToken:  resp.GetAccessToken(),
-		RefreshToken: resp.GetRefreshToken(),
-		AccessExp:    exp,
-	}, nil
-}
-
-// parseExp extracts "exp" claim as time.Time from a JWT.
-func parseExp(token string) (time.Time, error) {
-	parser := jwt.Parser{}
-	claims := jwt.MapClaims{}
-	_, _, err := parser.ParseUnverified(token, claims)
-	if err != nil {
-		return time.Time{}, err
-	}
-	switch v := claims["exp"].(type) {
-	case float64:
-		return time.Unix(int64(v), 0), nil
-	case json.Number:
-		n, _ := v.Int64()
-		return time.Unix(n, 0), nil
-	default:
-		return time.Time{}, errors.New("exp not found")
-	}
 }
