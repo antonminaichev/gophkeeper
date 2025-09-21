@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// mockItemsRepository is a mock implementation of storage.ItemsRepository interface
+// mockItemsRepository is a mock implementation of ItemsRepository interface
 type mockItemsRepository struct {
 	items       map[uuid.UUID]*storage.Item
 	humanIDs    map[uuid.UUID]int64

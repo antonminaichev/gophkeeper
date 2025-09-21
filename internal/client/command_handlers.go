@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	pb "github.com/antonminaichev/gophkeeper/api/proto"
+	pbconv "github.com/antonminaichev/gophkeeper/internal/converter"
+	"github.com/antonminaichev/gophkeeper/internal/validate"
 )
 
 const rpcTimeout = 10 * time.Second
@@ -19,7 +22,7 @@ func (cli *CLI) register() error {
 	if err != nil {
 		return err
 	}
-	if !validateEmail(email) {
+	if !validate.Email(email) {
 		return fmt.Errorf("invalid email")
 	}
 	pass1, err := readPassword("Password: ")
@@ -62,7 +65,7 @@ func (cli *CLI) login() error {
 	if err != nil {
 		return err
 	}
-	if !validateEmail(email) {
+	if !validate.Email(email) {
 		return fmt.Errorf("invalid email")
 	}
 	pass, err := readPassword("Password: ")
@@ -164,7 +167,7 @@ func (cli *CLI) sync() error {
 				Version:       it.Version,
 				UpdatedAtUnix: it.UpdatedAtUnix,
 				Deleted:       it.Deleted,
-				Meta:          sliceMetaToMap(it.Meta),
+				Meta:          pbconv.MetaSliceToMap(it.Meta),
 			}).DebugString())
 		}
 		total += len(resp.Items)
@@ -195,19 +198,67 @@ func (cli *CLI) itemList() error {
 	if err != nil {
 		return err
 	}
-	rows := make([]*CachedItem, 0, len(cache.Items))
-	for _, it := range cache.Items {
-		if !it.Deleted {
-			rows = append(rows, it)
-		}
+	// Читаем видимые (не удалённые) элементы из SQLite кэша.
+	rows, err := cache.db.Query(`
+		SELECT id, human_id, COALESCE(alias,''), type, version, updated_at_unix, deleted, COALESCE(meta_json,'')
+		FROM items
+		WHERE deleted = 0
+		ORDER BY updated_at_unix DESC, id DESC
+	`)
+	if err != nil {
+		return err
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].UpdatedAtUnix == rows[j].UpdatedAtUnix {
-			return rows[i].ID > rows[j].ID
+	defer rows.Close()
+
+	var out []*CachedItem
+	for rows.Next() {
+		var (
+			id          string
+			humanIDNull *int64
+			alias       string
+			typ         string
+			ver         int64
+			updatedUnix int64
+			deletedInt  int
+			metaJSON    string
+		)
+		if err := rows.Scan(&id, &humanIDNull, &alias, &typ, &ver, &updatedUnix, &deletedInt, &metaJSON); err != nil {
+			return err
 		}
-		return rows[i].UpdatedAtUnix > rows[j].UpdatedAtUnix
+		var meta map[string]string
+		if metaJSON != "" {
+			_ = json.Unmarshal([]byte(metaJSON), &meta)
+		} else {
+			meta = map[string]string{}
+		}
+		var humanID int64
+		if humanIDNull != nil {
+			humanID = *humanIDNull
+		}
+		out = append(out, &CachedItem{
+			ID:            id,
+			HumanID:       humanID,
+			Alias:         alias,
+			Type:          typ,
+			Version:       ver,
+			UpdatedAtUnix: updatedUnix,
+			Deleted:       deletedInt != 0,
+			Meta:          meta,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Дополнительная сортировка на клиенте не обязательна, но оставим как было.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAtUnix == out[j].UpdatedAtUnix {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].UpdatedAtUnix > out[j].UpdatedAtUnix
 	})
-	if len(rows) == 0 {
+
+	if len(out) == 0 {
 		fmt.Println("No items.")
 		return nil
 	}
@@ -218,7 +269,7 @@ func (cli *CLI) itemList() error {
 		strings.Repeat("-", 4),
 		strings.Repeat("-", 30),
 	)
-	for _, ci := range rows {
+	for _, ci := range out {
 		fmt.Println(ci.DebugString())
 	}
 	return nil
@@ -254,7 +305,7 @@ func (cli *CLI) itemGet(selector string) error {
 	}
 	fmt.Println("Type    :", it.Type.String())
 	fmt.Println("Version :", it.Version)
-	if t := metaTitle(it.Meta); t != "" {
+	if t := pbconv.Title(it.Meta); t != "" {
 		fmt.Println("Title   :", t)
 	}
 
@@ -349,7 +400,7 @@ func (cli *CLI) itemUpdate(selector string) error {
 	}
 
 	fmt.Printf("Current type: %s  version: %d\n", cur.Type.String(), cur.Version)
-	oldTitle := metaTitle(cur.Meta)
+	oldTitle := pbconv.Title(cur.Meta)
 	newTitle, _ := readLine(fmt.Sprintf("New title (empty=keep) [%s]: ", oldTitle))
 	newContent, _ := readLine("New content (empty=keep): ")
 
@@ -409,4 +460,31 @@ func (cli *CLI) itemDelete(selector string) error {
 		_ = SaveCache(cache)
 	}
 	return nil
+}
+
+// --- helpers ---
+
+// DebugString печатает одну строку таблицы списка.
+func (ci *CachedItem) DebugString() string {
+	// Идентификатор для колонки "ID":
+	// приоритет: @alias, затем human_id, затем укороченный UUID.
+	idCol := ""
+	switch {
+	case strings.TrimSpace(ci.Alias) != "":
+		idCol = "@" + strings.TrimSpace(ci.Alias)
+	case ci.HumanID > 0:
+		idCol = fmt.Sprintf("#%d", ci.HumanID)
+	default:
+		if len(ci.ID) >= 8 {
+			idCol = ci.ID[:8]
+		} else {
+			idCol = ci.ID
+		}
+	}
+
+	title := ci.Meta["title"]
+	if strings.TrimSpace(title) == "" {
+		title = "(no title)"
+	}
+	return fmt.Sprintf("%-22s  %-6s  %-4d  %s", idCol, ci.Type, ci.Version, title)
 }

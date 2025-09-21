@@ -1,6 +1,8 @@
 package auth
 
-import "context"
+import (
+	"context"
+)
 
 // contextKey is a private key type to avoid collisions with other packages.
 type contextKey string

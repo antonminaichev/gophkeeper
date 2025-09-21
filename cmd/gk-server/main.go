@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -14,7 +13,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -69,7 +67,7 @@ func main() {
 	var opts []grpc.ServerOption
 	opts = append(opts, grpc.UnaryInterceptor(middleware.AuthUnary(issuer.Public())))
 	if cfg.TLSEnable {
-		tlsCfg, err := makeServerTLSConfig(cfg)
+		tlsCfg, err := NewServerTLSConfig(cfg)
 		if err != nil {
 			log.Fatalf("tls config: %v", err)
 		}
@@ -156,42 +154,4 @@ func loadRSAPrivateKey(path string) (*rsa.PrivateKey, error) {
 	default:
 		return nil, fmt.Errorf("unsupported PEM type: %s", block.Type)
 	}
-}
-
-// makeServerTLSConfig builds tls.Config from env-backed config.
-// Supports optional client CA for mTLS.
-func makeServerTLSConfig(cfg config.Config) (*tls.Config, error) {
-	if strings.TrimSpace(cfg.TLSCertPath) == "" || strings.TrimSpace(cfg.TLSKeyPath) == "" {
-		return nil, errors.New("GK_TLS_CERT_PATH and GK_TLS_KEY_PATH are required when GK_TLS_ENABLE=true")
-	}
-
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCertPath, cfg.TLSKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("load key pair: %w", err)
-	}
-
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   0, // set below if requested
-	}
-
-	if cfg.TLSMinVersion12 {
-		tlsCfg.MinVersion = tls.VersionTLS12
-	}
-
-	// Optional client CA -> require and verify client cert (mTLS).
-	if caPath := strings.TrimSpace(cfg.TLSClientCAPath); caPath != "" {
-		caData, err := os.ReadFile(caPath)
-		if err != nil {
-			return nil, fmt.Errorf("read client CA: %w", err)
-		}
-		cp := x509.NewCertPool()
-		if !cp.AppendCertsFromPEM(caData) {
-			return nil, errors.New("parse client CA: no certs found")
-		}
-		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		tlsCfg.ClientCAs = cp
-	}
-
-	return tlsCfg, nil
 }

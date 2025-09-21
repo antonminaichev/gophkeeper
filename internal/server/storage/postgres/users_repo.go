@@ -23,7 +23,7 @@ func (r *UserRepo) Create(ctx context.Context, email string, passHash, passSalt 
 	email = normalizeEmail(email)
 
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO users (id, email, pass_hash, pass_salt) VALUES ($1, $2, $3, $4)`,
+		qCreateUser,
 		id, email, passHash, passSalt,
 	)
 	return id, err
@@ -34,7 +34,7 @@ func (r *UserRepo) ByEmail(ctx context.Context, email string) (*storage.User, er
 	email = normalizeEmail(email)
 
 	row := r.pool.QueryRow(ctx,
-		`SELECT id, email, pass_hash, pass_salt FROM users WHERE email = $1`,
+		qGetUser,
 		email,
 	)
 	var u storage.User

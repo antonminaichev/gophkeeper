@@ -1,8 +1,10 @@
 package client
 
-// Local cache for GophKeeper CLI.
+//Sqlite client cache
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,101 +15,70 @@ import (
 	"time"
 
 	pb "github.com/antonminaichev/gophkeeper/api/proto"
+	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
 )
 
-// cacheFile can be overridden via GK_CACHE_FILE.
+type Cache struct {
+	db *sql.DB
+}
+
+type CachedItem struct {
+	ID            string            `json:"id"`
+	HumanID       int64             `json:"human_id,omitempty"`
+	Alias         string            `json:"alias,omitempty"`
+	Type          string            `json:"type"`
+	Version       int64             `json:"version"`
+	UpdatedAtUnix int64             `json:"updated_at_unix"`
+	Deleted       bool              `json:"deleted"`
+	Meta          map[string]string `json:"meta,omitempty"`
+}
+
+const cacheSchemaVersion = 1
+
 func cacheFile() (string, error) {
-	if p := os.Getenv("GK_CACHE_FILE"); strings.TrimSpace(p) != "" {
+	if p := os.Getenv("GK_CACHE_FILE"); p != "" {
 		return p, nil
 	}
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "gophkeeper", "cache.json"), nil
+	return filepath.Join(dir, "gophkeeper", "cache.db"), nil
 }
 
-// Cache is a tiny on-disk index of user's items.
-type Cache struct {
-	Items   map[string]*CachedItem `json:"items"`
-	ByAlias map[string]string      `json:"by_alias"`
-	ByHuman map[int64]string       `json:"by_human"`
-	SavedAt time.Time              `json:"saved_at"`
-	Version int                    `json:"schema_version"`
-}
-
-// CachedItem is a denormalized snapshot (without payload).
-type CachedItem struct {
-	ID            string            `json:"id"`
-	HumanID       int64             `json:"human_id,omitempty"`
-	Alias         string            `json:"alias,omitempty"`
-	Type          string            `json:"type"` // pb.ItemType.String()
-	Version       int64             `json:"version"`
-	UpdatedAtUnix int64             `json:"updated_at_unix"`
-	Deleted       bool              `json:"deleted"`
-	Meta          map[string]string `json:"meta,omitempty"` // flat map for convenience
-}
-
-// LoadCache reads cache from disk (or returns an empty one if file missing).
 func LoadCache() (*Cache, error) {
 	path, err := cacheFile()
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return newEmptyCache(), nil
-		}
 		return nil, err
 	}
-	var c Cache
-	if err := json.Unmarshal(b, &c); err != nil {
+	_, _ = db.Exec(`PRAGMA journal_mode=WAL;`)
+	_, _ = db.Exec(`PRAGMA synchronous=NORMAL;`)
+
+	if err := initSchema(db); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	// Heal nil maps if needed
-	if c.Items == nil {
-		c.Items = make(map[string]*CachedItem)
-	}
-	if c.ByAlias == nil {
-		c.ByAlias = make(map[string]string)
-	}
-	if c.ByHuman == nil {
-		c.ByHuman = make(map[int64]string)
-	}
-	return &c, nil
+	return &Cache{db: db}, nil
 }
 
-func newEmptyCache() *Cache {
-	return &Cache{
-		Items:   make(map[string]*CachedItem),
-		ByAlias: make(map[string]string),
-		ByHuman: make(map[int64]string),
-		Version: 1,
-	}
-}
-
-// SaveCache writes cache to disk.
 func SaveCache(c *Cache) error {
-	if c == nil {
+	if c == nil || c.db == nil {
 		return errors.New("nil cache")
 	}
-	path, err := cacheFile()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	c.SavedAt = time.Now()
-	b, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, b, 0o600); err != nil { // Windows ignores perms
-		return err
-	}
-	return nil
+	_, err := c.db.Exec(`
+		INSERT INTO meta(key, value) VALUES ('saved_at', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, time.Now().Format(time.RFC3339Nano))
+	return err
 }
 
 func ClearCache() error {
@@ -121,115 +92,161 @@ func ClearCache() error {
 	return nil
 }
 
-// ApplyChanges applies a batch of server items to the cache.
+func (c *Cache) Close() error {
+	if c == nil || c.db == nil {
+		return nil
+	}
+	return c.db.Close()
+}
+
 func (c *Cache) ApplyChanges(items []*pb.Item) {
+	if c == nil || c.db == nil || len(items) == 0 {
+		return
+	}
+	ctx := context.Background()
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO items(
+			id, human_id, alias, type, version, updated_at_unix, deleted, meta_json
+		) VALUES(?, ?, NULLIF(TRIM(?),''), ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			human_id        = excluded.human_id,
+			alias           = excluded.alias,
+			type            = excluded.type,
+			version         = excluded.version,
+			updated_at_unix = excluded.updated_at_unix,
+			deleted         = excluded.deleted,
+			meta_json       = excluded.meta_json
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return
+	}
 	for _, it := range items {
-		c.upsertOrDelete(it)
-	}
-}
-
-// UpsertFromItem updates cache from a single fetched item (e.g., after Create/Get/Update).
-func (c *Cache) UpsertFromItem(it *pb.Item) {
-	c.upsertOrDelete(it)
-}
-
-func (c *Cache) upsertOrDelete(it *pb.Item) {
-	if it == nil || strings.TrimSpace(it.Id) == "" {
-		return
-	}
-	id := strings.TrimSpace(it.Id)
-
-	// If deleting: remove from maps and exit.
-	if it.Deleted {
-		if old, ok := c.Items[id]; ok {
-			if old.Alias != "" {
-				delete(c.ByAlias, strings.ToLower(old.Alias))
-			}
-			if old.HumanID > 0 {
-				delete(c.ByHuman, old.HumanID)
-			}
-		}
-		delete(c.Items, id)
-		return
-	}
-
-	// Build/merge item.
-	meta := make(map[string]string, len(it.Meta))
-	for _, kv := range it.Meta {
-		k := strings.TrimSpace(kv.GetKey())
-		if k == "" {
+		if it == nil {
 			continue
 		}
-		meta[k] = kv.GetValue()
+		metaJSON, _ := encodeMeta(it.GetMeta())
+		_, _ = stmt.ExecContext(ctx,
+			strings.TrimSpace(it.GetId()),
+			nullInt64(it.GetHumanId()),
+			strings.TrimSpace(it.GetAlias()),
+			it.GetType().String(),
+			it.GetVersion(),
+			it.GetUpdatedAtUnix(),
+			boolToInt(it.GetDeleted()),
+			metaJSON,
+		)
 	}
-	alias := strings.TrimSpace(it.Alias)
-
-	ci, exists := c.Items[id]
-	if !exists {
-		ci = &CachedItem{ID: id}
-		c.Items[id] = ci
-	}
-	// Remove old index entries if key changed.
-	if ci.Alias != "" && !strings.EqualFold(ci.Alias, alias) {
-		delete(c.ByAlias, strings.ToLower(ci.Alias))
-	}
-	if ci.HumanID > 0 && ci.HumanID != it.HumanId && it.HumanId > 0 {
-		delete(c.ByHuman, ci.HumanID)
-	}
-
-	// Update fields.
-	ci.HumanID = it.HumanId
-	ci.Alias = alias
-	ci.Type = it.Type.String()
-	ci.Version = it.Version
-	ci.UpdatedAtUnix = it.UpdatedAtUnix
-	ci.Deleted = false
-	ci.Meta = meta
-
-	// Re-index new keys.
-	if alias != "" {
-		c.ByAlias[strings.ToLower(alias)] = id
-	}
-	if it.HumanId > 0 {
-		c.ByHuman[it.HumanId] = id
-	}
+	_ = stmt.Close()
+	_ = tx.Commit()
 }
 
-// LookupID resolves selector to canonical UUID via cache.
+func (c *Cache) UpsertFromItem(it *pb.Item) {
+	if c == nil || c.db == nil || it == nil {
+		return
+	}
+	c.ApplyChanges([]*pb.Item{it})
+}
+
 func (c *Cache) LookupID(selector string) (string, bool) {
 	s := strings.TrimSpace(selector)
 	if s == "" {
 		return "", false
 	}
-	if LooksLikeUUID(s) {
-		// We trust UUID; even if it's not in cache yet, caller may still use it.
+
+	if _, err := uuid.Parse(s); err == nil {
 		return s, true
 	}
-	if strings.HasPrefix(s, "@") {
-		key := strings.ToLower(strings.TrimPrefix(s, "@"))
-		id, ok := c.ByAlias[key]
-		return id, ok
-	}
+
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
-		id, ok := c.ByHuman[n]
-		return id, ok
+		var id string
+		err := c.db.QueryRow(`SELECT id FROM items WHERE human_id = ? AND deleted = 0`, n).Scan(&id)
+		if err == nil && id != "" {
+			return id, true
+		}
+		return "", false
+	}
+
+	a := strings.TrimPrefix(s, "@")
+	if a == "" {
+		return "", false
+	}
+	var id string
+	err := c.db.QueryRow(`SELECT id FROM items WHERE LOWER(alias) = LOWER(?) AND deleted = 0`, a).Scan(&id)
+	if err == nil && id != "" {
+		return id, true
 	}
 	return "", false
 }
 
-// DebugString builds a short one-line representation for printing lists/logs.
-func (c *CachedItem) DebugString() string {
-	tag := c.ID
-	var parts []string
-	if c.HumanID > 0 {
-		parts = append(parts, fmt.Sprintf("#%d", c.HumanID))
+func initSchema(db *sql.DB) error {
+	// meta
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		return err
 	}
-	if c.Alias != "" {
-		parts = append(parts, "(@"+c.Alias+")")
+	// items
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS items (
+			id               TEXT PRIMARY KEY,
+			human_id         INTEGER,
+			alias            TEXT UNIQUE,
+			type             TEXT NOT NULL,
+			version          INTEGER NOT NULL,
+			updated_at_unix  INTEGER NOT NULL,
+			deleted          INTEGER NOT NULL CHECK (deleted IN (0,1)),
+			meta_json        TEXT
+		);
+	`); err != nil {
+		return err
 	}
-	if len(parts) > 0 {
-		tag = strings.Join(parts, " ")
+	_, _ = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_items_alias_ci ON items(LOWER(alias)) WHERE alias IS NOT NULL;`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_items_human_id ON items(human_id) WHERE human_id IS NOT NULL;`)
+	_, _ = db.Exec(`
+		INSERT INTO meta(key, value) VALUES ('schema_version', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, fmt.Sprint(cacheSchemaVersion))
+	return nil
+}
+
+func encodeMeta(entries []*pb.ItemMetaEntry) (string, error) {
+	if len(entries) == 0 {
+		return "", nil
 	}
-	title := c.Meta["title"]
-	return fmt.Sprintf("%-22s  %-6s  v%-3d  %s", tag, c.Type, c.Version, title)
+	m := make(map[string]string, len(entries))
+	for _, kv := range entries {
+		k := strings.TrimSpace(kv.GetKey())
+		if k == "" {
+			continue
+		}
+		m[k] = kv.GetValue()
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func nullInt64(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/antonminaichev/gophkeeper/internal/auth"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -65,14 +66,24 @@ func SaveSession(s *Session) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+
 	s.SavedAt = time.Now()
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	// Best effort restrictive perms; on Windows this is ignored.
-	if err := os.WriteFile(path, b, 0o600); err != nil {
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(path)
+		if err2 := os.Rename(tmp, path); err2 != nil {
+			_ = os.Remove(tmp)
+			return err2
+		}
 	}
 	return nil
 }
@@ -107,7 +118,7 @@ func (s *Session) WithAuth(ctx context.Context) context.Context {
 
 // SaveLoginTokens parses exp from access token and persists session.
 func SaveLoginTokens(access, refresh string) error {
-	exp, err := parseExp(access)
+	exp, err := auth.Expiration(access)
 	if err != nil {
 		return fmt.Errorf("parse access token: %w", err)
 	}

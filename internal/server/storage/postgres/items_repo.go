@@ -35,23 +35,13 @@ func (r *ItemsRepo) Create(
 
 	// Allocate per-owner human id: first call inserts (1), next calls increment.
 	var humanID int64
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO items_counter(owner_id, next_id)
-		VALUES ($1, 1)
-		ON CONFLICT (owner_id)
-		DO UPDATE SET next_id = items_counter.next_id + 1
-		RETURNING next_id
-	`, owner).Scan(&humanID); err != nil {
+	if err := tx.QueryRow(ctx, qIsertItemCounter, owner).Scan(&humanID); err != nil {
 		return uuid.Nil, 0, err
 	}
 
 	id := uuid.New()
 	var version int64
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO items (id, owner_id, human_id, alias, type, payload, meta)
-		VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, '{}'::jsonb))
-		RETURNING version
-	`, id, owner, humanID, alias, typ, payload, metaJSON).Scan(&version); err != nil {
+	if err := tx.QueryRow(ctx, qInsertItem, id, owner, humanID, alias, typ, payload, metaJSON).Scan(&version); err != nil {
 		return uuid.Nil, 0, err
 	}
 
@@ -63,34 +53,19 @@ func (r *ItemsRepo) Create(
 
 // Get returns a single non-deleted item by id for the owner.
 func (r *ItemsRepo) Get(ctx context.Context, owner uuid.UUID, id uuid.UUID) (*storage.Item, error) {
-	row := r.pool.QueryRow(ctx, `
-		SELECT id, owner_id, human_id, alias, type, payload, meta, version,
-		       deleted_at, updated_at, created_at
-		FROM items
-		WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
-	`, id, owner)
+	row := r.pool.QueryRow(ctx, qSelectNonDeletedItemByID, id, owner)
 	return scanItem(row)
 }
 
 // GetByHuman returns an item by per-owner human id.
 func (r *ItemsRepo) GetByHuman(ctx context.Context, owner uuid.UUID, hid int64) (*storage.Item, error) {
-	row := r.pool.QueryRow(ctx, `
-		SELECT id, owner_id, human_id, alias, type, payload, meta, version,
-		       deleted_at, updated_at, created_at
-		FROM items
-		WHERE owner_id = $1 AND human_id = $2 AND deleted_at IS NULL
-	`, owner, hid)
+	row := r.pool.QueryRow(ctx, qSelectNonDeletedItemByHuman, owner, hid)
 	return scanItem(row)
 }
 
 // GetByAlias returns an item by alias.
 func (r *ItemsRepo) GetByAlias(ctx context.Context, owner uuid.UUID, alias string) (*storage.Item, error) {
-	row := r.pool.QueryRow(ctx, `
-		SELECT id, owner_id, human_id, alias, type, payload, meta, version,
-		       deleted_at, updated_at, created_at
-		FROM items
-		WHERE owner_id = $1 AND alias = $2 AND deleted_at IS NULL
-	`, owner, alias)
+	row := r.pool.QueryRow(ctx, qSelectNonDeletedItemByAlias, owner, alias)
 	return scanItem(row)
 }
 
@@ -99,14 +74,7 @@ func (r *ItemsRepo) List(ctx context.Context, owner uuid.UUID, limit int32) ([]s
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, owner_id, human_id, alias, type, payload, meta, version,
-		       deleted_at, updated_at, created_at
-		FROM items
-		WHERE owner_id = $1 AND deleted_at IS NULL
-		ORDER BY updated_at DESC
-		LIMIT $2
-	`, owner, limit)
+	rows, err := r.pool.Query(ctx, qListItems, owner, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -128,18 +96,7 @@ func (r *ItemsRepo) ListChanges(ctx context.Context, owner uuid.UUID, after time
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, owner_id, human_id, alias, type, payload, meta, version,
-		       deleted_at, updated_at, created_at
-		FROM items
-		WHERE owner_id = $1
-		  AND (
-		       updated_at > $2
-		       OR (updated_at = $2 AND id > $3)
-		  )
-		ORDER BY updated_at ASC, id ASC
-		LIMIT $4
-	`, owner, after, afterID, limit)
+	rows, err := r.pool.Query(ctx, qListChanges, owner, after, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -164,19 +121,7 @@ func (r *ItemsRepo) Update(
 	payload, metaJSON []byte,
 	expectedVersion int64,
 ) (*storage.Item, error) {
-	row := r.pool.QueryRow(ctx, `
-		UPDATE items
-		SET payload   = COALESCE($4, payload),
-		    meta      = COALESCE($5, meta),
-		    version   = version + 1,
-		    updated_at = now()
-		WHERE id = $1
-		  AND owner_id = $2
-		  AND deleted_at IS NULL
-		  AND version = $3
-		RETURNING id, owner_id, human_id, alias, type, payload, meta, version,
-		          deleted_at, updated_at, created_at
-	`, id, owner, expectedVersion, payload, metaJSON)
+	row := r.pool.QueryRow(ctx, qUpdateItem, id, owner, expectedVersion, payload, metaJSON)
 
 	it, err := scanItem(row)
 	if err != nil {
@@ -191,12 +136,7 @@ func (r *ItemsRepo) Update(
 
 // Delete marks the item as deleted and bumps updated_at (tombstone entry).
 func (r *ItemsRepo) Delete(ctx context.Context, owner uuid.UUID, id uuid.UUID) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE items
-		SET deleted_at = $3,
-		    updated_at = $3
-		WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
-	`, id, owner, time.Now())
+	_, err := r.pool.Exec(ctx, qDeletedItem, id, owner, time.Now())
 	return err
 }
 
