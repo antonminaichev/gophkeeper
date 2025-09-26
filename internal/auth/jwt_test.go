@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"strings"
 	"testing"
 	"time"
 
@@ -273,11 +274,15 @@ func TestTokenExpiration(t *testing.T) {
 	time.Sleep(accessTTL + 100*time.Millisecond)
 
 	// Parse access token again to check expiration
-	accessToken2, err := jwt.Parse(pair.AccessToken, func(token *jwt.Token) (interface{}, error) {
+	accessToken2, err := jwt.ParseWithClaims(pair.AccessToken, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return issuer.Public(), nil
-	})
+	}, jwt.WithLeeway(0))
 	if err != nil {
-		t.Fatalf("Failed to parse access token after expiration: %v", err)
+		// Ожидаем ошибку истечения токена
+		if !strings.Contains(err.Error(), "expired") {
+			t.Fatalf("Expected expiration error, got: %v", err)
+		}
+		return // Тест прошел успешно
 	}
 
 	if accessToken2.Valid {
@@ -305,6 +310,63 @@ func verifyToken(tokenString string, publicKey *rsa.PublicKey) error {
 	return nil
 }
 
+func TestRandHex(t *testing.T) {
+	tests := []struct {
+		name     string
+		n        int
+		expected int // expected length of result
+	}{
+		{
+			name:     "positive number",
+			n:        8,
+			expected: 16, // 8 bytes = 16 hex chars
+		},
+		{
+			name:     "zero",
+			n:        0,
+			expected: 32, // default 16 bytes = 32 hex chars
+		},
+		{
+			name:     "negative number",
+			n:        -5,
+			expected: 32, // default 16 bytes = 32 hex chars
+		},
+		{
+			name:     "large number",
+			n:        32,
+			expected: 64, // 32 bytes = 64 hex chars
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := randHex(tt.n)
+			if len(result) != tt.expected {
+				t.Errorf("randHex(%d) length = %d, want %d", tt.n, len(result), tt.expected)
+			}
+
+			// Check that result contains only hex characters
+			for _, c := range result {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+					t.Errorf("randHex(%d) contains non-hex character: %c", tt.n, c)
+				}
+			}
+		})
+	}
+}
+
+func TestRandHexUniqueness(t *testing.T) {
+	// Test that randHex produces different results
+	results := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		result := randHex(8)
+		if results[result] {
+			t.Errorf("randHex() produced duplicate result: %s", result)
+		}
+		results[result] = true
+	}
+}
+
 // Benchmark tests
 func BenchmarkIssue(b *testing.B) {
 	key := generateTestKeyPair(&testing.T{})
@@ -318,5 +380,3 @@ func BenchmarkIssue(b *testing.B) {
 		}
 	}
 }
-
-

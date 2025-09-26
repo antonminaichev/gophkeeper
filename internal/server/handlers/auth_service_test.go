@@ -1,306 +1,231 @@
+// file: handlers/auth_service_test.go
 package handlers
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"testing"
+	"time"
 
 	pb "github.com/antonminaichev/gophkeeper/api/proto"
 	"github.com/antonminaichev/gophkeeper/internal/auth"
+	"github.com/antonminaichev/gophkeeper/internal/crypto"
 	"github.com/antonminaichev/gophkeeper/internal/server/storage"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// mockUsersStore is a mock implementation of usersStore interface
-type mockUsersStore struct {
-	users   map[string]*storage.User
-	created []uuid.UUID
+// ---- test helpers ----
+
+type memUsers struct {
+	createFn  func(ctx context.Context, email string, passHash, passSalt []byte) (uuid.UUID, error)
+	byEmailFn func(ctx context.Context, email string) (*storage.User, error)
 }
 
-func newMockUsersStore() *mockUsersStore {
-	return &mockUsersStore{
-		users: make(map[string]*storage.User),
+func (m *memUsers) Create(ctx context.Context, email string, passHash, passSalt []byte) (uuid.UUID, error) {
+	return m.createFn(ctx, email, passHash, passSalt)
+}
+func (m *memUsers) ByEmail(ctx context.Context, email string) (*storage.User, error) {
+	return m.byEmailFn(ctx, email)
+}
+
+func newTestIssuer(t *testing.T) *auth.Issuer {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	// см. /internal/auth/jwt.go: func NewIssuer(priv *rsa.PrivateKey, access, refresh time.Duration) *Issuer
+	return auth.NewIssuer(key, time.Minute, time.Hour)
+}
+
+// ---- Register ----
+
+func TestRegister_InvalidEmail(t *testing.T) {
+	s := NewAuthServer(&memUsers{}, newTestIssuer(t))
+	_, err := s.Register(context.Background(), &pb.RegisterRequest{Email: "  \t", Password: "12345678"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("got %v, want InvalidArgument", st.Code())
 	}
 }
 
-func (m *mockUsersStore) Create(ctx context.Context, email string, passHash, passSalt []byte) (uuid.UUID, error) {
-	// Simulate unique constraint violation
-	if _, exists := m.users[email]; exists {
-		return uuid.Nil, &mockPgError{code: "23505"}
+func TestRegister_ShortPassword(t *testing.T) {
+	s := NewAuthServer(&memUsers{}, newTestIssuer(t))
+	_, err := s.Register(context.Background(), &pb.RegisterRequest{Email: "a@b.c", Password: "123"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("got %v, want InvalidArgument", st.Code())
 	}
+}
 
+func TestRegister_AlreadyExists(t *testing.T) {
+	store := &memUsers{
+		createFn: func(ctx context.Context, email string, passHash, passSalt []byte) (uuid.UUID, error) {
+			return uuid.Nil, &pgconn.PgError{Code: "23505"}
+		},
+	}
+	s := NewAuthServer(store, newTestIssuer(t))
+	_, err := s.Register(context.Background(), &pb.RegisterRequest{Email: "a@b.c", Password: "12345678"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.AlreadyExists {
+		t.Fatalf("got %v, want AlreadyExists", st.Code())
+	}
+}
+
+func TestRegister_InternalOnCreate(t *testing.T) {
+	store := &memUsers{
+		createFn: func(ctx context.Context, email string, passHash, passSalt []byte) (uuid.UUID, error) {
+			return uuid.Nil, errors.New("db down")
+		},
+	}
+	s := NewAuthServer(store, newTestIssuer(t))
+	_, err := s.Register(context.Background(), &pb.RegisterRequest{Email: "a@b.c", Password: "12345678"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.Internal {
+		t.Fatalf("got %v, want Internal", st.Code())
+	}
+}
+
+func TestRegister_OK(t *testing.T) {
 	id := uuid.New()
-	m.users[email] = &storage.User{
-		ID:       id,
-		Email:    email,
-		PassHash: passHash,
-		PassSalt: passSalt,
+	var gotEmail string
+	store := &memUsers{
+		createFn: func(ctx context.Context, email string, passHash, passSalt []byte) (uuid.UUID, error) {
+			if len(passHash) == 0 || len(passSalt) == 0 {
+				t.Fatalf("hash/salt empty")
+			}
+			gotEmail = email
+			return id, nil
+		},
 	}
-	m.created = append(m.created, id)
-	return id, nil
-}
-
-func (m *mockUsersStore) ByEmail(ctx context.Context, email string) (*storage.User, error) {
-	user, exists := m.users[email]
-	if !exists {
-		return nil, &mockPgError{code: "23505"} // Simulate not found
+	s := NewAuthServer(store, newTestIssuer(t))
+	resp, err := s.Register(context.Background(), &pb.RegisterRequest{Email: "  USER@Example.Com \n", Password: "12345678"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
 	}
-	return user, nil
+	if resp.GetUserId() != id.String() {
+		t.Fatalf("userId=%q want %q", resp.GetUserId(), id.String())
+	}
+	if gotEmail != "user@example.com" {
+		t.Fatalf("normalized email=%q", gotEmail)
+	}
 }
 
-// mockPgError simulates PostgreSQL error
-type mockPgError struct {
-	code string
+// ---- Login ----
+
+func TestLogin_InvalidArgs(t *testing.T) {
+	s := NewAuthServer(&memUsers{}, newTestIssuer(t))
+	_, err := s.Login(context.Background(), &pb.LoginRequest{Email: "", Password: ""})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("got %v, want InvalidArgument", st.Code())
+	}
 }
 
-func (e *mockPgError) Error() string {
-	return "mock pg error"
+func TestLogin_NotFound(t *testing.T) {
+	s := NewAuthServer(&memUsers{
+		byEmailFn: func(ctx context.Context, email string) (*storage.User, error) { return nil, errors.New("no rows") },
+	}, newTestIssuer(t))
+	_, err := s.Login(context.Background(), &pb.LoginRequest{Email: "x@y.z", Password: "12345678"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.NotFound {
+		t.Fatalf("got %v, want NotFound", st.Code())
+	}
 }
 
-func (e *mockPgError) Code() string {
-	return e.code
+func TestLogin_InvalidPassword(t *testing.T) {
+	salt, hash, _ := crypto.HashPassword(crypto.DefaultArgon, []byte("right-pass"))
+	user := &storage.User{ID: uuid.New(), Email: "x@y.z", PassSalt: salt, PassHash: hash}
+	s := NewAuthServer(&memUsers{
+		byEmailFn: func(ctx context.Context, email string) (*storage.User, error) { return user, nil },
+	}, newTestIssuer(t))
+	_, err := s.Login(context.Background(), &pb.LoginRequest{Email: "x@y.z", Password: "wrong"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.PermissionDenied {
+		t.Fatalf("got %v, want PermissionDenied", st.Code())
+	}
 }
 
-// generateTestPrivateKey creates a test RSA private key
-func generateTestPrivateKey(t *testing.T) *rsa.PrivateKey {
-	// This is a test key - in production you'd use a real key
-	// For testing purposes, we'll skip key generation
-	t.Skip("Skipping JWT tests - requires proper RSA key setup")
-	return nil
+func TestLogin_OK(t *testing.T) {
+	salt, hash, _ := crypto.HashPassword(crypto.DefaultArgon, []byte("secret-123"))
+	user := &storage.User{ID: uuid.New(), Email: "x@y.z", PassSalt: salt, PassHash: hash}
+	iss := newTestIssuer(t)
+	s := NewAuthServer(&memUsers{
+		byEmailFn: func(ctx context.Context, email string) (*storage.User, error) { return user, nil },
+	}, iss)
+
+	resp, err := s.Login(context.Background(), &pb.LoginRequest{Email: "  X@Y.Z  ", Password: "secret-123"})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if resp.GetAccessToken() == "" || resp.GetRefreshToken() == "" {
+		t.Fatalf("empty tokens")
+	}
 }
 
-// TestAuthServer tests the AuthServer implementation
-func TestAuthServer(t *testing.T) {
-	// Create mock dependencies
-	usersStore := newMockUsersStore()
+// ---- Refresh ----
 
-	// Create JWT issuer (using test keys)
-	testPrivateKey := generateTestPrivateKey(t)
-	issuer := auth.NewIssuer(testPrivateKey, 3600, 86400)
+func TestRefresh_MissingToken(t *testing.T) {
+	s := NewAuthServer(&memUsers{}, newTestIssuer(t))
+	_, err := s.Refresh(context.Background(), &pb.RefreshRequest{RefreshToken: ""})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("got %v, want InvalidArgument", st.Code())
+	}
+}
 
-	server := NewAuthServer(usersStore, issuer)
+func TestRefresh_InvalidTokenFormat(t *testing.T) {
+	s := NewAuthServer(&memUsers{}, newTestIssuer(t))
+	_, err := s.Refresh(context.Background(), &pb.RefreshRequest{RefreshToken: "not-a-jwt"})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.Unauthenticated {
+		t.Fatalf("got %v, want Unauthenticated", st.Code())
+	}
+}
 
-	t.Run("Register valid user", func(t *testing.T) {
-		req := &pb.RegisterRequest{
-			Email:    "test@example.com",
-			Password: "password123",
-		}
+func TestRefresh_InsufficientScope_UsingAccessToken(t *testing.T) {
+	iss := newTestIssuer(t)
+	s := NewAuthServer(&memUsers{}, iss)
+	// получаем пару и подсовываем access как "refresh" -> подпись валидна, scope != refresh
+	tp, err := iss.Issue("u1", "u@e")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	_, err = s.Refresh(context.Background(), &pb.RefreshRequest{RefreshToken: tp.AccessToken})
+	st, _ := status.FromError(err)
+	if st.Code() != codes.PermissionDenied {
+		t.Fatalf("got %v, want PermissionDenied", st.Code())
+	}
+}
 
-		resp, err := server.Register(context.Background(), req)
-		if err != nil {
-			t.Errorf("Register() error = %v", err)
-		}
-		if resp == nil {
-			t.Errorf("Register() returned nil response")
-		}
-		if resp.UserId == "" {
-			t.Errorf("Register() returned empty user ID")
-		}
-	})
+func TestRefresh_OK(t *testing.T) {
+	iss := newTestIssuer(t)
+	s := NewAuthServer(&memUsers{}, iss)
+	tp, err := iss.Issue("user-123", "u@e")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	resp, err := s.Refresh(context.Background(), &pb.RefreshRequest{RefreshToken: tp.RefreshToken})
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if resp.GetAccessToken() == "" || resp.GetRefreshToken() == "" {
+		t.Fatalf("empty tokens")
+	}
+}
 
-	t.Run("Register with invalid email", func(t *testing.T) {
-		req := &pb.RegisterRequest{
-			Email:    "",
-			Password: "password123",
-		}
+// ---- normalizeEmail ----
 
-		_, err := server.Register(context.Background(), req)
-		if err == nil {
-			t.Errorf("Register() with empty email should return error")
-		}
-
-		statusErr, ok := status.FromError(err)
-		if !ok {
-			t.Errorf("Register() error should be gRPC status error")
-		}
-		if statusErr.Code() != codes.InvalidArgument {
-			t.Errorf("Register() error code = %v, want %v", statusErr.Code(), codes.InvalidArgument)
-		}
-	})
-
-	t.Run("Register with short password", func(t *testing.T) {
-		req := &pb.RegisterRequest{
-			Email:    "test@example.com",
-			Password: "short",
-		}
-
-		_, err := server.Register(context.Background(), req)
-		if err == nil {
-			t.Errorf("Register() with short password should return error")
-		}
-
-		statusErr, ok := status.FromError(err)
-		if !ok {
-			t.Errorf("Register() error should be gRPC status error")
-		}
-		if statusErr.Code() != codes.InvalidArgument {
-			t.Errorf("Register() error code = %v, want %v", statusErr.Code(), codes.InvalidArgument)
-		}
-	})
-
-	t.Run("Register duplicate user", func(t *testing.T) {
-		email := "duplicate@example.com"
-		req := &pb.RegisterRequest{
-			Email:    email,
-			Password: "password123",
-		}
-
-		// Register first time
-		_, err := server.Register(context.Background(), req)
-		if err != nil {
-			t.Errorf("First Register() error = %v", err)
-		}
-
-		// Try to register again
-		_, err = server.Register(context.Background(), req)
-		if err == nil {
-			t.Errorf("Register() duplicate user should return error")
-		}
-
-		statusErr, ok := status.FromError(err)
-		if !ok {
-			t.Errorf("Register() error should be gRPC status error")
-		}
-		if statusErr.Code() != codes.AlreadyExists {
-			t.Errorf("Register() error code = %v, want %v", statusErr.Code(), codes.AlreadyExists)
-		}
-	})
-
-	t.Run("Login valid user", func(t *testing.T) {
-		email := "login@example.com"
-		password := "password123"
-
-		// Register user first
-		req := &pb.RegisterRequest{
-			Email:    email,
-			Password: password,
-		}
-		_, err := server.Register(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Register() error = %v", err)
-		}
-
-		// Login
-		loginReq := &pb.LoginRequest{
-			Email:    email,
-			Password: password,
-		}
-		resp, err := server.Login(context.Background(), loginReq)
-		if err != nil {
-			t.Errorf("Login() error = %v", err)
-		}
-		if resp == nil {
-			t.Errorf("Login() returned nil response")
-		}
-		if resp.AccessToken == "" {
-			t.Errorf("Login() returned empty access token")
-		}
-		if resp.RefreshToken == "" {
-			t.Errorf("Login() returned empty refresh token")
-		}
-	})
-
-	t.Run("Login with invalid credentials", func(t *testing.T) {
-		req := &pb.LoginRequest{
-			Email:    "nonexistent@example.com",
-			Password: "wrongpassword",
-		}
-
-		_, err := server.Login(context.Background(), req)
-		if err == nil {
-			t.Errorf("Login() with invalid credentials should return error")
-		}
-
-		statusErr, ok := status.FromError(err)
-		if !ok {
-			t.Errorf("Login() error should be gRPC status error")
-		}
-		if statusErr.Code() != codes.NotFound {
-			t.Errorf("Login() error code = %v, want %v", statusErr.Code(), codes.NotFound)
-		}
-	})
-
-	t.Run("Login with wrong password", func(t *testing.T) {
-		email := "wrongpass@example.com"
-		password := "password123"
-
-		// Register user first
-		req := &pb.RegisterRequest{
-			Email:    email,
-			Password: password,
-		}
-		_, err := server.Register(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Register() error = %v", err)
-		}
-
-		// Login with wrong password
-		loginReq := &pb.LoginRequest{
-			Email:    email,
-			Password: "wrongpassword",
-		}
-		_, err = server.Login(context.Background(), loginReq)
-		if err == nil {
-			t.Errorf("Login() with wrong password should return error")
-		}
-
-		statusErr, ok := status.FromError(err)
-		if !ok {
-			t.Errorf("Login() error should be gRPC status error")
-		}
-		if statusErr.Code() != codes.PermissionDenied {
-			t.Errorf("Login() error code = %v, want %v", statusErr.Code(), codes.PermissionDenied)
-		}
-	})
-
-	t.Run("Login with empty credentials", func(t *testing.T) {
-		req := &pb.LoginRequest{
-			Email:    "",
-			Password: "",
-		}
-
-		_, err := server.Login(context.Background(), req)
-		if err == nil {
-			t.Errorf("Login() with empty credentials should return error")
-		}
-
-		statusErr, ok := status.FromError(err)
-		if !ok {
-			t.Errorf("Login() error should be gRPC status error")
-		}
-		if statusErr.Code() != codes.InvalidArgument {
-			t.Errorf("Login() error code = %v, want %v", statusErr.Code(), codes.InvalidArgument)
-		}
-	})
-
-	t.Run("Email normalization", func(t *testing.T) {
-		email := "  TEST@EXAMPLE.COM  "
-		normalizedEmail := "test@example.com"
-		password := "password123"
-
-		// Register with normalized email
-		req := &pb.RegisterRequest{
-			Email:    normalizedEmail,
-			Password: password,
-		}
-		_, err := server.Register(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Register() error = %v", err)
-		}
-
-		// Login with different case/spaces
-		loginReq := &pb.LoginRequest{
-			Email:    email,
-			Password: password,
-		}
-		resp, err := server.Login(context.Background(), loginReq)
-		if err != nil {
-			t.Errorf("Login() error = %v", err)
-		}
-		if resp == nil {
-			t.Errorf("Login() returned nil response")
-		}
-	})
+func TestNormalizeEmail(t *testing.T) {
+	if normalizeEmail("") != "" {
+		t.Fatalf("empty -> empty expected")
+	}
+	if got := normalizeEmail(" \tUser@Example.COM \r\n"); got != "user@example.com" {
+		t.Fatalf("normalize=%q", got)
+	}
 }

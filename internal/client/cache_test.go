@@ -209,8 +209,10 @@ func TestUpsertFromItem(t *testing.T) {
 	}
 	defer c.Close()
 
+	// Создаем валидный UUID для теста
+	itemUUID := "550e8400-e29b-41d4-a716-446655440000"
 	item := &pb.Item{
-		Id:            "item1",
+		Id:            itemUUID,
 		HumanId:       1,
 		Alias:         "test1",
 		Type:          pb.ItemType_TEXT,
@@ -224,14 +226,14 @@ func TestUpsertFromItem(t *testing.T) {
 	c.UpsertFromItem(item)
 
 	// Проверим, что можно найти по трём селекторам
-	if id, ok := c.LookupID("item1"); !ok || id != "item1" {
-		t.Fatalf("LookupID(uuid) = %q,%v; want item1,true", id, ok)
+	if id, ok := c.LookupID(itemUUID); !ok || id != itemUUID {
+		t.Fatalf("LookupID(uuid) = %q,%v; want %s,true", id, ok, itemUUID)
 	}
-	if id, ok := c.LookupID("@test1"); !ok || id != "item1" {
-		t.Fatalf("LookupID(@test1) = %q,%v; want item1,true", id, ok)
+	if id, ok := c.LookupID("@test1"); !ok || id != itemUUID {
+		t.Fatalf("LookupID(@test1) = %q,%v; want %s,true", id, ok, itemUUID)
 	}
-	if id, ok := c.LookupID("1"); !ok || id != "item1" {
-		t.Fatalf("LookupID(1) = %q,%v; want item1,true", id, ok)
+	if id, ok := c.LookupID("1"); !ok || id != itemUUID {
+		t.Fatalf("LookupID(1) = %q,%v; want %s,true", id, ok, itemUUID)
 	}
 }
 
