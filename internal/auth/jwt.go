@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/hex"
+	"errors"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -94,4 +95,20 @@ func randHex(n int) string {
 	buf := make([]byte, n)
 	_, _ = rand.Read(buf)
 	return hex.EncodeToString(buf)
+}
+
+func Expiration(raw string) (time.Time, error) {
+	if raw == "" {
+		return time.Time{}, errors.New("empty token")
+	}
+	var claims jwt.MapClaims
+	_, _, err := new(jwt.Parser).ParseUnverified(raw, &claims)
+	if err != nil {
+		return time.Time{}, err
+	}
+	exp, err := claims.GetExpirationTime()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return exp.Time, nil
 }

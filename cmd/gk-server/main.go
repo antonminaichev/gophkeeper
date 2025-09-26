@@ -24,6 +24,7 @@ import (
 	"github.com/antonminaichev/gophkeeper/internal/server/storage/postgres"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
@@ -31,7 +32,7 @@ import (
 
 func main() {
 	cfg := config.FromEnv()
-	log.Printf("starting gRPC server on %s", cfg.GRPCAddr)
+	log.Printf("starting gRPC server on %s (tls=%v)", cfg.GRPCAddr, cfg.TLSEnable)
 
 	ctx, cancel := signalContext()
 	defer cancel()
@@ -43,7 +44,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Migrations with flag
+	// Optional migrations
 	if cfg.RunMigrations {
 		if err := postgres.RunMigrations(cfg.DBDSN); err != nil {
 			log.Fatalf("migrations: %v", err)
@@ -62,10 +63,18 @@ func main() {
 	usersRepo := postgres.NewUserRepo(pool)
 	itemsRepo := postgres.NewItemsRepo(pool)
 
-	// gRPC server with auth middleware
-	s := grpc.NewServer(
-		grpc.UnaryInterceptor(middleware.AuthUnary(issuer.Public())),
-	)
+	// gRPC server options: auth middleware + optional TLS
+	var opts []grpc.ServerOption
+	opts = append(opts, grpc.UnaryInterceptor(middleware.AuthUnary(issuer.Public())))
+	if cfg.TLSEnable {
+		tlsCfg, err := NewServerTLSConfig(cfg)
+		if err != nil {
+			log.Fatalf("tls config: %v", err)
+		}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+
+	s := grpc.NewServer(opts...)
 
 	// Services
 	pb.RegisterAuthServiceServer(s, handlers.NewAuthServer(usersRepo, issuer))
@@ -77,18 +86,17 @@ func main() {
 	healthpb.RegisterHealthServer(s, hs)
 	reflection.Register(s)
 
+	// Listen & serve
 	lis, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 
-	// Serve in background, handle shutdown below.
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Serve(lis) }()
 
 	select {
 	case <-ctx.Done():
-		// Graceful shutdown.
 		done := make(chan struct{})
 		go func() {
 			s.GracefulStop()
